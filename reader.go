@@ -179,6 +179,59 @@ func (f *File) Open() (rc io.ReadCloser, err error) {
 	return
 }
 
+// OpenStream returns a ReadCloser that provides access to the File's contents
+// using streaming decryption for ZipCrypto encrypted files.
+// This method is memory-efficient for large encrypted files as it decrypts
+// data on-the-fly without loading the entire file into memory.
+// For AES encrypted files, it behaves the same as Open() since AES decryption
+// is already streaming.
+// Multiple files may be read concurrently.
+func (f *File) OpenStream() (rc io.ReadCloser, err error) {
+	bodyOffset, err := f.findBodyOffset()
+	if err != nil {
+		return
+	}
+	// If f is encrypted, CompressedSize64 includes salt, pwvv, encrypted data,
+	// and auth code lengths
+	size := int64(f.CompressedSize64)
+	var r io.Reader
+	rr := io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset, size)
+	// check for encryption
+	if f.IsEncrypted() {
+		if f.ae == 0 {
+			// Use streaming decryption for ZipCrypto
+			if r, err = ZipCryptoDecryptorStream(rr, f.password()); err != nil {
+				return
+			}
+		} else if r, err = newDecryptionReader(rr, f); err != nil {
+			return
+		}
+	} else {
+		r = rr
+	}
+	dcomp := decompressor(f.Method)
+	if dcomp == nil {
+		err = ErrAlgorithm
+		return
+	}
+	rc = dcomp(r)
+	// If AE-2, skip CRC and possible dataDescriptor
+	if f.isAE2() {
+		return
+	}
+	var desr io.Reader
+	if f.hasDataDescriptor() {
+		desr = io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset+size, dataDescriptorLen)
+	}
+	rc = &checksumReader{
+		rc:   rc,
+		hash: crc32.NewIEEE(),
+		f:    f,
+		desr: desr,
+	}
+	return
+}
+
 type checksumReader struct {
 	rc    io.ReadCloser
 	hash  hash.Hash32

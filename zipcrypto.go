@@ -66,6 +66,8 @@ func crc32update(pCrc32 uint32, bval byte) uint32 {
 	return crc32.IEEETable[(pCrc32 ^ uint32(bval)) & 0xff] ^ (pCrc32 >> 8)
 }
 
+// ZipCryptoDecryptor creates a decryptor using buffered mode (loads all data into memory).
+// For large files, consider using ZipCryptoDecryptorStream instead.
 func ZipCryptoDecryptor(r *io.SectionReader, password []byte) (*io.SectionReader, error) {
 	z := NewZipCrypto(password)
 	b := make([]byte, r.Size())
@@ -74,6 +76,65 @@ func ZipCryptoDecryptor(r *io.SectionReader, password []byte) (*io.SectionReader
 
 	m := z.Decrypt(b)
 	return io.NewSectionReader(bytes.NewReader(m), 12, int64(len(m))), nil
+}
+
+// zipCryptoReader implements streaming decryption for ZipCrypto.
+// It decrypts data on-the-fly without loading the entire file into memory.
+type zipCryptoReader struct {
+	r           io.Reader
+	z           *ZipCrypto
+	headerRead  bool
+	remaining   int64 // remaining bytes to read (-1 for unknown)
+}
+
+// Read implements io.Reader interface for streaming decryption.
+func (zcr *zipCryptoReader) Read(p []byte) (int, error) {
+	if !zcr.headerRead {
+		// Read and decrypt the 12-byte encryption header first
+		header := make([]byte, 12)
+		if _, err := io.ReadFull(zcr.r, header); err != nil {
+			return 0, err
+		}
+		// Decrypt header (updates keys state)
+		zcr.z.Decrypt(header)
+		zcr.headerRead = true
+	}
+
+	// Read and decrypt data in streaming fashion
+	n, err := zcr.r.Read(p)
+	if n > 0 {
+		// Decrypt in-place
+		for i := 0; i < n; i++ {
+			v := p[i] ^ zcr.z.magicByte()
+			zcr.z.updateKeys(v)
+			p[i] = v
+		}
+	}
+	return n, err
+}
+
+// ZipCryptoDecryptorStream creates a streaming decryptor that decrypts data on-the-fly.
+// This method is memory-efficient for large files as it doesn't load all data into memory.
+// Returns an io.Reader that produces decrypted data.
+func ZipCryptoDecryptorStream(r io.Reader, password []byte) (io.Reader, error) {
+	z := NewZipCrypto(password)
+	return &zipCryptoReader{
+		r:          r,
+		z:          z,
+		headerRead: false,
+	}, nil
+}
+
+// ZipCryptoDecryptorStreamWithSize creates a streaming decryptor with known size.
+// This is useful when you need to track the remaining bytes.
+func ZipCryptoDecryptorStreamWithSize(r io.Reader, password []byte, size int64) (io.Reader, error) {
+	z := NewZipCrypto(password)
+	return &zipCryptoReader{
+		r:          r,
+		z:          z,
+		headerRead: false,
+		remaining:  size - 12, // subtract header size
+	}, nil
 }
 
 type zipCryptoWriter struct {

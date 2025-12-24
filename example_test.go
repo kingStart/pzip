@@ -11,7 +11,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/yeka/zip"
+	zip "github.com/kingStart/pzip"
 )
 
 func ExampleWriter() {
@@ -110,4 +110,95 @@ func ExampleWriter_Encrypt() {
 	}
 	// Output:
 	// Hello World
+}
+
+// ExampleOpenStream demonstrates streaming decryption for large encrypted files.
+// This method is memory-efficient as it decrypts data on-the-fly without loading
+// the entire file into memory. Ideal for large files (e.g., 50GB+).
+func ExampleFile_OpenStream() {
+	contents := []byte("Hello World - Streaming Decryption Example")
+
+	// Create an encrypted zip using ZipCrypto (StandardEncryption)
+	raw := new(bytes.Buffer)
+	zipw := zip.NewWriter(raw)
+	w, err := zipw.Encrypt("hello.txt", "golang", zip.StandardEncryption)
+	if err != nil {
+		log.Fatal(err)
+	}
+	_, err = io.Copy(w, bytes.NewReader(contents))
+	if err != nil {
+		log.Fatal(err)
+	}
+	zipw.Close()
+
+	// Read using streaming decryption - memory efficient for large files
+	zipr, err := zip.NewReader(bytes.NewReader(raw.Bytes()), int64(raw.Len()))
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, z := range zipr.File {
+		z.SetPassword("golang")
+		// Use OpenStream() instead of Open() for streaming decryption
+		rr, err := z.OpenStream()
+		if err != nil {
+			log.Fatal(err)
+		}
+		_, err = io.Copy(os.Stdout, rr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		rr.Close()
+	}
+	// Output:
+	// Hello World - Streaming Decryption Example
+}
+
+// ExampleFile_OpenStream_chunked demonstrates processing large files in chunks.
+// This pattern is useful when you need precise control over memory usage.
+func ExampleFile_OpenStream_chunked() {
+	contents := []byte("Chunked streaming decryption example data")
+
+	// Create an encrypted zip
+	raw := new(bytes.Buffer)
+	zipw := zip.NewWriter(raw)
+	w, err := zipw.Encrypt("data.bin", "password123", zip.StandardEncryption)
+	if err != nil {
+		log.Fatal(err)
+	}
+	_, err = io.Copy(w, bytes.NewReader(contents))
+	if err != nil {
+		log.Fatal(err)
+	}
+	zipw.Close()
+
+	// Read in chunks - useful for very large files
+	zipr, err := zip.NewReader(bytes.NewReader(raw.Bytes()), int64(raw.Len()))
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, z := range zipr.File {
+		z.SetPassword("password123")
+		rr, err := z.OpenStream()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		// Process in fixed-size chunks (e.g., 16 bytes for demo, use 32KB+ in production)
+		buf := make([]byte, 16)
+		for {
+			n, err := rr.Read(buf)
+			if n > 0 {
+				fmt.Print(string(buf[:n]))
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+		rr.Close()
+	}
+	// Output:
+	// Chunked streaming decryption example data
 }
