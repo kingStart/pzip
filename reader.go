@@ -334,6 +334,12 @@ func readDirectoryHeader(f *File, r io.Reader) error {
 	f.Extra = d[filenameLen : filenameLen+extraLen]
 	f.Comment = string(d[filenameLen+extraLen:])
 
+	// ZIP64 fields are only present if the corresponding 32-bit field
+	// is set to 0xFFFFFFFF. See APPNOTE 4.5.3 and golang.org/issue/13367.
+	needUSize := f.UncompressedSize == ^uint32(0)
+	needCSize := f.CompressedSize == ^uint32(0)
+	needHeaderOffset := f.headerOffset == int64(^uint32(0))
+
 	if len(f.Extra) > 0 {
 		b := readBuf(f.Extra)
 		for len(b) >= 4 { // need at least tag and size
@@ -345,37 +351,47 @@ func readDirectoryHeader(f *File, r io.Reader) error {
 			eb := readBuf(b[:size])
 			switch tag {
 			case zip64ExtraId:
-				// update directory values from the zip64 extra block
-				if len(eb) >= 8 {
+				if needUSize {
+					needUSize = false
+					if len(eb) < 8 {
+						return ErrFormat
+					}
 					f.UncompressedSize64 = eb.uint64()
 				}
-				if len(eb) >= 8 {
+				if needCSize {
+					needCSize = false
+					if len(eb) < 8 {
+						return ErrFormat
+					}
 					f.CompressedSize64 = eb.uint64()
 				}
-				if len(eb) >= 8 {
+				if needHeaderOffset {
+					needHeaderOffset = false
+					if len(eb) < 8 {
+						return ErrFormat
+					}
 					f.headerOffset = int64(eb.uint64())
 				}
 			case winzipAesExtraId:
-				// grab the AE version
 				f.ae = eb.uint16()
-				// skip vendor ID
-				_ = eb.uint16()
-				// AES strength
+				_ = eb.uint16() // vendor ID
 				f.aesStrength = eb.uint8()
-				// set the actual compression method.
 				f.Method = eb.uint16()
 			}
 			b = b[size:]
 		}
-		// Should have consumed the whole header.
-		// But popular zip & JAR creation tools are broken and
-		// may pad extra zeros at the end, so accept those
-		// too. See golang.org/issue/8186.
+		// Popular zip & JAR tools may pad extra zeros at the end.
+		// Accept zero-padding but reject any non-zero trailing bytes.
+		// See golang.org/issue/8186.
 		for _, v := range b {
 			if v != 0 {
 				return ErrFormat
 			}
 		}
+	}
+
+	if needUSize || needCSize || needHeaderOffset {
+		return ErrFormat
 	}
 	return nil
 }

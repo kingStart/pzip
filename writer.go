@@ -79,17 +79,15 @@ func (w *Writer) Close() error {
 		b.uint16(h.ModifiedDate)
 		b.uint32(h.CRC32)
 		if h.isZip64() || h.offset > uint32max {
-			// the file needs a zip64 header. store maxint in both
-			// 32 bit size fields (and offset later) to signal that the
-			// zip64 extra header should be used.
-			b.uint32(uint32max) // compressed size
-			b.uint32(uint32max) // uncompressed size
+			b.uint32(uint32max)
+			b.uint32(uint32max)
 
-			// append a zip64 extra block to Extra
-			var buf [28]byte // 2x uint16 + 3x uint64
+			// Always write all three 64-bit fields for backward compatibility
+			// with older pzip readers that unconditionally read all three.
+			var buf [28]byte
 			eb := writeBuf(buf[:])
 			eb.uint16(zip64ExtraId)
-			eb.uint16(24) // size = 3x uint64
+			eb.uint16(24) // 3 × 8 bytes
 			eb.uint64(h.UncompressedSize64)
 			eb.uint64(h.CompressedSize64)
 			eb.uint64(h.offset)
