@@ -13,8 +13,6 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
-	"path"
-	"strings"
 	"time"
 )
 
@@ -144,16 +142,22 @@ func isInsecurePath(name string) bool {
 	if name == "" {
 		return false
 	}
-	if strings.HasPrefix(name, "/") || strings.HasPrefix(name, `\`) {
+	if name[0] == '/' || name[0] == '\\' {
 		return true
 	}
 	if len(name) >= 2 && name[1] == ':' && ((name[0] >= 'a' && name[0] <= 'z') || (name[0] >= 'A' && name[0] <= 'Z')) {
 		return true
 	}
-	for _, c := range strings.Split(path.Clean(name), "/") {
-		if c == ".." {
+	// Scan for ".." components without allocating
+	for i := 0; i < len(name); {
+		j := i
+		for j < len(name) && name[j] != '/' && name[j] != '\\' {
+			j++
+		}
+		if j-i == 2 && name[i] == '.' && name[i+1] == '.' {
 			return true
 		}
+		i = j + 1
 	}
 	return false
 }

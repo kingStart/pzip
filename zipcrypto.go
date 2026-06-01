@@ -39,26 +39,37 @@ func (z *ZipCrypto) magicByte() byte {
 	return byte((t * (t ^ 1)) >> 8)
 }
 
-func (z *ZipCrypto) Encrypt(data []byte) []byte {
-	length := len(data)
-	chiper := make([]byte, length)
-	for i := 0; i < length; i++ {
-		v := data[i]
-		chiper[i] = v ^ z.magicByte()
+// encryptTo encrypts src into dst in-place (dst and src may overlap or be the
+// same slice). For encryption, updateKeys uses the plaintext byte.
+func (z *ZipCrypto) encryptTo(dst, src []byte) {
+	for i, v := range src {
+		dst[i] = v ^ z.magicByte()
 		z.updateKeys(v)
 	}
-	return chiper
 }
 
-func (z *ZipCrypto) Decrypt(chiper []byte) []byte {
-	length := len(chiper)
-	plain := make([]byte, length)
-	for i, c := range chiper {
+// decryptInPlace decrypts data in-place, returning the same slice.
+func (z *ZipCrypto) decryptInPlace(data []byte) []byte {
+	for i, c := range data {
 		v := c ^ z.magicByte()
 		z.updateKeys(v)
-		plain[i] = v
+		data[i] = v
 	}
-	return plain
+	return data
+}
+
+// Encrypt returns a new encrypted copy. Kept for backward compatibility.
+func (z *ZipCrypto) Encrypt(data []byte) []byte {
+	out := make([]byte, len(data))
+	z.encryptTo(out, data)
+	return out
+}
+
+// Decrypt returns a new decrypted copy. Kept for backward compatibility.
+func (z *ZipCrypto) Decrypt(chiper []byte) []byte {
+	out := make([]byte, len(chiper))
+	copy(out, chiper)
+	return z.decryptInPlace(out)
 }
 
 func crc32update(pCrc32 uint32, bval byte) uint32 {
@@ -70,46 +81,18 @@ type zipCryptoReader struct {
 	r          io.Reader
 	z          *ZipCrypto
 	headerRead bool
+	checkByte  byte // 0 means no verification
+	verify     bool
 }
 
 func (zcr *zipCryptoReader) Read(p []byte) (int, error) {
 	if !zcr.headerRead {
-		header := make([]byte, 12)
-		if _, err := io.ReadFull(zcr.r, header); err != nil {
+		var header [12]byte
+		if _, err := io.ReadFull(zcr.r, header[:]); err != nil {
 			return 0, err
 		}
-		zcr.z.Decrypt(header)
-		zcr.headerRead = true
-	}
-
-	n, err := zcr.r.Read(p)
-	if n > 0 {
-		for i := 0; i < n; i++ {
-			v := p[i] ^ zcr.z.magicByte()
-			zcr.z.updateKeys(v)
-			p[i] = v
-		}
-	}
-	return n, err
-}
-
-// zipCryptoValidatingReader adds password verification via the 12-byte
-// encryption header check byte (PKWARE APPNOTE 6.1.4).
-type zipCryptoValidatingReader struct {
-	r          io.Reader
-	z          *ZipCrypto
-	headerRead bool
-	checkByte  byte // expected high byte of ModifiedTime (data descriptor) or CRC-32
-}
-
-func (zcr *zipCryptoValidatingReader) Read(p []byte) (int, error) {
-	if !zcr.headerRead {
-		header := make([]byte, 12)
-		if _, err := io.ReadFull(zcr.r, header); err != nil {
-			return 0, err
-		}
-		decrypted := zcr.z.Decrypt(header)
-		if decrypted[11] != zcr.checkByte {
+		zcr.z.decryptInPlace(header[:])
+		if zcr.verify && header[11] != zcr.checkByte {
 			return 0, ErrPassword
 		}
 		zcr.headerRead = true
@@ -117,29 +100,24 @@ func (zcr *zipCryptoValidatingReader) Read(p []byte) (int, error) {
 
 	n, err := zcr.r.Read(p)
 	if n > 0 {
-		for i := 0; i < n; i++ {
-			v := p[i] ^ zcr.z.magicByte()
-			zcr.z.updateKeys(v)
-			p[i] = v
-		}
+		zcr.z.decryptInPlace(p[:n])
 	}
 	return n, err
 }
 
 // ZipCryptoDecryptor creates a streaming decryptor with password verification.
-// The checkByte should be the high byte of ModifiedTime (when data descriptor
-// flag is set) or the high byte of CRC-32.
 func ZipCryptoDecryptor(r io.Reader, password []byte, checkByte byte) (io.Reader, error) {
 	z := NewZipCrypto(password)
-	return &zipCryptoValidatingReader{
+	return &zipCryptoReader{
 		r:         r,
 		z:         z,
 		checkByte: checkByte,
+		verify:    true,
 	}, nil
 }
 
 // ZipCryptoDecryptorStream creates a streaming decryptor without password
-// verification. Use ZipCryptoDecryptor for new code when check byte is available.
+// verification. Use ZipCryptoDecryptor when check byte is available.
 func ZipCryptoDecryptorStream(r io.Reader, password []byte) (io.Reader, error) {
 	z := NewZipCrypto(password)
 	return &zipCryptoReader{
@@ -153,30 +131,39 @@ type zipCryptoWriter struct {
 	z     *ZipCrypto
 	first bool
 	fw    *fileWriter
+	buf   []byte // reusable encryption buffer
 }
 
 func (z *zipCryptoWriter) Write(p []byte) (n int, err error) {
 	if z.first {
 		z.first = false
-		header := []byte{0xF8, 0x53, 0xCF, 0x05, 0x2D, 0xDD, 0xAD, 0xC8, 0x66, 0x3F, 0x8C, 0xAC}
-		header = z.z.Encrypt(header)
+		var header [12]byte
+		copy(header[:], []byte{0xF8, 0x53, 0xCF, 0x05, 0x2D, 0xDD, 0xAD, 0xC8, 0x66, 0x3F, 0x8C, 0xAC})
+		z.z.encryptTo(header[:], header[:])
 
 		crc := z.fw.ModifiedTime
 		header[10] = byte(crc)
 		header[11] = byte(crc >> 8)
 
 		z.z.init()
-		if _, err = z.w.Write(z.z.Encrypt(header)); err != nil {
+		z.z.encryptTo(header[:], header[:])
+		if _, err = z.w.Write(header[:]); err != nil {
 			return 0, err
 		}
 	}
-	nn, err := z.w.Write(z.z.Encrypt(p))
+	// Grow reusable buffer if needed
+	if cap(z.buf) < len(p) {
+		z.buf = make([]byte, len(p))
+	}
+	z.buf = z.buf[:len(p)]
+	z.z.encryptTo(z.buf, p)
+	nn, err := z.w.Write(z.buf)
 	n = nn
 	return
 }
 
 func ZipCryptoEncryptor(i io.Writer, pass passwordFn, fw *fileWriter) (io.Writer, error) {
 	z := NewZipCrypto(pass())
-	zc := &zipCryptoWriter{i, z, true, fw}
+	zc := &zipCryptoWriter{w: i, z: z, first: true, fw: fw}
 	return zc, nil
 }

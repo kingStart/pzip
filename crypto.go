@@ -200,13 +200,12 @@ func (a *authReader) Read(p []byte) (int, error) {
 		return n, a.err
 	}
 	if end {
-		ab := new(bytes.Buffer)
-		_, err = io.Copy(ab, a.adata)
-		if err != nil || ab.Len() != 10 {
+		var authcode [10]byte
+		if _, err = io.ReadFull(a.adata, authcode[:]); err != nil {
 			a.err = ErrDecryption
 			return n, a.err
 		}
-		if !a.checkAuthentication(ab.Bytes()) {
+		if !a.checkAuthentication(authcode[:]) {
 			a.err = ErrAuthentication
 			return n, a.err
 		}
@@ -232,21 +231,16 @@ func (a *bufferedAuthReader) Read(b []byte) (int, error) {
 			a.err = err
 			return 0, a.err
 		}
-		ab := new(bytes.Buffer)
-		nn, err := io.Copy(ab, a.adata)
-		if err != nil {
-			a.err = err
-			return 0, a.err
-		} else if nn != 10 {
+		var authcode [10]byte
+		if _, err = io.ReadFull(a.adata, authcode[:]); err != nil {
 			a.err = ErrDecryption
 			return 0, a.err
 		}
-		_, err = a.mac.Write(a.buf.Bytes())
-		if err != nil {
+		if _, err = a.mac.Write(a.buf.Bytes()); err != nil {
 			a.err = err
 			return 0, a.err
 		}
-		if !a.checkAuthentication(ab.Bytes()) {
+		if !a.checkAuthentication(authcode[:]) {
 			a.err = ErrAuthentication
 			return 0, a.err
 		}
@@ -309,10 +303,6 @@ func newDecryptionReader(r *io.SectionReader, f *File) (io.Reader, error) {
 		return nil, ErrFormat
 	}
 	dataLen := int64(f.CompressedSize64 - overhead)
-	// // TODO(alex): Should the compressed sizes be fixed?
-	// // Not the ideal place to do this.
-	// f.CompressedSize64 = uint64(dataLen)
-	// f.CompressedSize = uint32(dataLen)
 	data := io.NewSectionReader(r, dataOff, dataLen)
 	authOff := dataOff + dataLen
 	authcode := io.NewSectionReader(r, authOff, 10)
