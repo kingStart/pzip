@@ -13,15 +13,13 @@ import (
 	"io"
 )
 
-// TODO(adg): support zip file comments
-// TODO(adg): support specifying deflate level
-
 // Writer implements a zip file writer.
 type Writer struct {
-	cw     *countWriter
-	dir    []*header
-	last   *fileWriter
-	closed bool
+	cw      *countWriter
+	dir     []*header
+	last    *fileWriter
+	closed  bool
+	comment string
 }
 
 type header struct {
@@ -43,6 +41,16 @@ func (w *Writer) SetOffset(n int64) {
 		panic("zip: SetOffset called after data was written")
 	}
 	w.cw.count = n
+}
+
+// SetComment sets the end-of-central-directory comment field.
+// It must be called before Close. The comment must not exceed 65535 bytes.
+func (w *Writer) SetComment(comment string) error {
+	if len(comment) > uint16max {
+		return errors.New("zip: Writer.SetComment: comment too long")
+	}
+	w.comment = comment
+	return nil
 }
 
 // Flush flushes any buffered data to the underlying writer.
@@ -162,14 +170,19 @@ func (w *Writer) Close() error {
 	var buf [directoryEndLen]byte
 	b := writeBuf(buf[:])
 	b.uint32(uint32(directoryEndSignature))
-	b = b[4:]                 // skip over disk number and first disk number (2x uint16)
-	b.uint16(uint16(records)) // number of entries this disk
-	b.uint16(uint16(records)) // number of entries total
-	b.uint32(uint32(size))    // size of directory
-	b.uint32(uint32(offset))  // start of directory
-	// skipped size of comment (always zero)
+	b = b[4:]                        // skip over disk number and first disk number (2x uint16)
+	b.uint16(uint16(records))        // number of entries this disk
+	b.uint16(uint16(records))        // number of entries total
+	b.uint32(uint32(size))           // size of directory
+	b.uint32(uint32(offset))         // start of directory
+	b.uint16(uint16(len(w.comment))) // comment length
 	if _, err := w.cw.Write(buf[:]); err != nil {
 		return err
+	}
+	if len(w.comment) > 0 {
+		if _, err := io.WriteString(w.cw, w.comment); err != nil {
+			return err
+		}
 	}
 
 	return w.cw.w.(*bufio.Writer).Flush()
@@ -209,10 +222,20 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
 	}
 
 	fh.Flags |= 0x8 // we will write a data descriptor
-	// TODO(alex): Look at spec and see if these need to be changed
-	// when using encryption.
 	fh.CreatorVersion = fh.CreatorVersion&0xff00 | zipVersion20 // preserve compatibility byte
 	fh.ReaderVersion = zipVersion20
+
+	// Write extended timestamp extra field when Modified is set
+	if !fh.Modified.IsZero() {
+		fh.ModifiedDate, fh.ModifiedTime = timeToMsDosTime(fh.Modified)
+		var buf [9]byte
+		eb := writeBuf(buf[:])
+		eb.uint16(extTimeExtraId)
+		eb.uint16(5)         // data size: 1 byte flags + 4 bytes mtime
+		eb.uint8(1)          // flags: modification time present
+		eb.uint32(uint32(fh.Modified.Unix()))
+		fh.Extra = append(fh.Extra, buf[:]...)
+	}
 
 	fw := &fileWriter{
 		zipw:      w.cw,
@@ -264,6 +287,82 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
 
 	w.last = fw
 	return fw, nil
+}
+
+// Copy copies the file f (obtained from a Reader) into w. It copies the raw
+// compressed data directly without decompressing and recompressing, so it is
+// efficient for transferring entries between ZIP files without modification.
+func (w *Writer) Copy(f *File) error {
+	r, err := f.OpenRaw()
+	if err != nil {
+		return err
+	}
+
+	// close any previous open file
+	if w.last != nil && !w.last.closed {
+		if err := w.last.close(); err != nil {
+			return err
+		}
+		w.last = nil
+	}
+
+	fh := f.FileHeader
+	// Write local file header with known sizes (no data descriptor needed)
+	fh.Flags &^= 0x8 // clear data descriptor flag
+
+	h := &header{
+		FileHeader: &fh,
+		offset:     uint64(w.cw.count),
+	}
+	w.dir = append(w.dir, h)
+
+	if err := writeRawHeader(w.cw, &fh); err != nil {
+		return err
+	}
+	if _, err := io.Copy(w.cw, r); err != nil {
+		return err
+	}
+	return nil
+}
+
+func writeRawHeader(w io.Writer, h *FileHeader) error {
+	var buf [fileHeaderLen]byte
+	b := writeBuf(buf[:])
+	b.uint32(uint32(fileHeaderSignature))
+	b.uint16(h.ReaderVersion)
+	b.uint16(h.Flags)
+	b.uint16(h.Method)
+	b.uint16(h.ModifiedTime)
+	b.uint16(h.ModifiedDate)
+	b.uint32(h.CRC32)
+	if h.isZip64() {
+		b.uint32(uint32max)
+		b.uint32(uint32max)
+	} else {
+		b.uint32(h.CompressedSize)
+		b.uint32(h.UncompressedSize)
+	}
+	// Prepare extra with ZIP64 info if needed
+	extra := h.Extra
+	if h.isZip64() {
+		var zip64buf [20]byte
+		eb := writeBuf(zip64buf[:])
+		eb.uint16(zip64ExtraId)
+		eb.uint16(16)
+		eb.uint64(h.UncompressedSize64)
+		eb.uint64(h.CompressedSize64)
+		extra = append(zip64buf[:], extra...)
+	}
+	b.uint16(uint16(len(h.Name)))
+	b.uint16(uint16(len(extra)))
+	if _, err := w.Write(buf[:]); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, h.Name); err != nil {
+		return err
+	}
+	_, err := w.Write(extra)
+	return err
 }
 
 func writeHeader(w io.Writer, h *FileHeader) error {

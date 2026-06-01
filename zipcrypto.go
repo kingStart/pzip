@@ -1,14 +1,13 @@
 package zip
 
 import (
-	"io"
-	"bytes"
 	"hash/crc32"
+	"io"
 )
 
 type ZipCrypto struct {
 	password []byte
-	Keys [3]uint32
+	Keys     [3]uint32
 }
 
 func NewZipCrypto(passphrase []byte) *ZipCrypto {
@@ -29,10 +28,10 @@ func (z *ZipCrypto) init() {
 }
 
 func (z *ZipCrypto) updateKeys(byteValue byte) {
-	z.Keys[0] = crc32update(z.Keys[0], byteValue);
-	z.Keys[1] += z.Keys[0] & 0xff;
-	z.Keys[1] = z.Keys[1] * 134775813 + 1;
-	z.Keys[2] = crc32update(z.Keys[2], (byte) (z.Keys[1] >> 24));
+	z.Keys[0] = crc32update(z.Keys[0], byteValue)
+	z.Keys[1] += z.Keys[0] & 0xff
+	z.Keys[1] = z.Keys[1]*134775813 + 1
+	z.Keys[2] = crc32update(z.Keys[2], byte(z.Keys[1]>>24))
 }
 
 func (z *ZipCrypto) magicByte() byte {
@@ -55,7 +54,7 @@ func (z *ZipCrypto) Decrypt(chiper []byte) []byte {
 	length := len(chiper)
 	plain := make([]byte, length)
 	for i, c := range chiper {
-		v := c ^ z.magicByte();
+		v := c ^ z.magicByte()
 		z.updateKeys(v)
 		plain[i] = v
 	}
@@ -63,47 +62,28 @@ func (z *ZipCrypto) Decrypt(chiper []byte) []byte {
 }
 
 func crc32update(pCrc32 uint32, bval byte) uint32 {
-	return crc32.IEEETable[(pCrc32 ^ uint32(bval)) & 0xff] ^ (pCrc32 >> 8)
-}
-
-// ZipCryptoDecryptor creates a decryptor using buffered mode (loads all data into memory).
-// For large files, consider using ZipCryptoDecryptorStream instead.
-func ZipCryptoDecryptor(r *io.SectionReader, password []byte) (*io.SectionReader, error) {
-	z := NewZipCrypto(password)
-	b := make([]byte, r.Size())
-
-	r.Read(b)
-
-	m := z.Decrypt(b)
-	return io.NewSectionReader(bytes.NewReader(m), 12, int64(len(m))), nil
+	return crc32.IEEETable[(pCrc32^uint32(bval))&0xff] ^ (pCrc32 >> 8)
 }
 
 // zipCryptoReader implements streaming decryption for ZipCrypto.
-// It decrypts data on-the-fly without loading the entire file into memory.
 type zipCryptoReader struct {
-	r           io.Reader
-	z           *ZipCrypto
-	headerRead  bool
-	remaining   int64 // remaining bytes to read (-1 for unknown)
+	r          io.Reader
+	z          *ZipCrypto
+	headerRead bool
 }
 
-// Read implements io.Reader interface for streaming decryption.
 func (zcr *zipCryptoReader) Read(p []byte) (int, error) {
 	if !zcr.headerRead {
-		// Read and decrypt the 12-byte encryption header first
 		header := make([]byte, 12)
 		if _, err := io.ReadFull(zcr.r, header); err != nil {
 			return 0, err
 		}
-		// Decrypt header (updates keys state)
 		zcr.z.Decrypt(header)
 		zcr.headerRead = true
 	}
 
-	// Read and decrypt data in streaming fashion
 	n, err := zcr.r.Read(p)
 	if n > 0 {
-		// Decrypt in-place
 		for i := 0; i < n; i++ {
 			v := p[i] ^ zcr.z.magicByte()
 			zcr.z.updateKeys(v)
@@ -113,27 +93,58 @@ func (zcr *zipCryptoReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// ZipCryptoDecryptorStream creates a streaming decryptor that decrypts data on-the-fly.
-// This method is memory-efficient for large files as it doesn't load all data into memory.
-// Returns an io.Reader that produces decrypted data.
-func ZipCryptoDecryptorStream(r io.Reader, password []byte) (io.Reader, error) {
+// zipCryptoValidatingReader adds password verification via the 12-byte
+// encryption header check byte (PKWARE APPNOTE 6.1.4).
+type zipCryptoValidatingReader struct {
+	r          io.Reader
+	z          *ZipCrypto
+	headerRead bool
+	checkByte  byte // expected high byte of ModifiedTime (data descriptor) or CRC-32
+}
+
+func (zcr *zipCryptoValidatingReader) Read(p []byte) (int, error) {
+	if !zcr.headerRead {
+		header := make([]byte, 12)
+		if _, err := io.ReadFull(zcr.r, header); err != nil {
+			return 0, err
+		}
+		decrypted := zcr.z.Decrypt(header)
+		if decrypted[11] != zcr.checkByte {
+			return 0, ErrPassword
+		}
+		zcr.headerRead = true
+	}
+
+	n, err := zcr.r.Read(p)
+	if n > 0 {
+		for i := 0; i < n; i++ {
+			v := p[i] ^ zcr.z.magicByte()
+			zcr.z.updateKeys(v)
+			p[i] = v
+		}
+	}
+	return n, err
+}
+
+// ZipCryptoDecryptor creates a streaming decryptor with password verification.
+// The checkByte should be the high byte of ModifiedTime (when data descriptor
+// flag is set) or the high byte of CRC-32.
+func ZipCryptoDecryptor(r io.Reader, password []byte, checkByte byte) (io.Reader, error) {
 	z := NewZipCrypto(password)
-	return &zipCryptoReader{
-		r:          r,
-		z:          z,
-		headerRead: false,
+	return &zipCryptoValidatingReader{
+		r:         r,
+		z:         z,
+		checkByte: checkByte,
 	}, nil
 }
 
-// ZipCryptoDecryptorStreamWithSize creates a streaming decryptor with known size.
-// This is useful when you need to track the remaining bytes.
-func ZipCryptoDecryptorStreamWithSize(r io.Reader, password []byte, size int64) (io.Reader, error) {
+// ZipCryptoDecryptorStream creates a streaming decryptor without password
+// verification. Use ZipCryptoDecryptor for new code when check byte is available.
+func ZipCryptoDecryptorStream(r io.Reader, password []byte) (io.Reader, error) {
 	z := NewZipCrypto(password)
 	return &zipCryptoReader{
-		r:          r,
-		z:          z,
-		headerRead: false,
-		remaining:  size - 12, // subtract header size
+		r: r,
+		z: z,
 	}, nil
 }
 
@@ -145,7 +156,6 @@ type zipCryptoWriter struct {
 }
 
 func (z *zipCryptoWriter) Write(p []byte) (n int, err error) {
-	err = nil
 	if z.first {
 		z.first = false
 		header := []byte{0xF8, 0x53, 0xCF, 0x05, 0x2D, 0xDD, 0xAD, 0xC8, 0x66, 0x3F, 0x8C, 0xAC}
@@ -156,14 +166,16 @@ func (z *zipCryptoWriter) Write(p []byte) (n int, err error) {
 		header[11] = byte(crc >> 8)
 
 		z.z.init()
-		z.w.Write(z.z.Encrypt(header))
-		n += 12
+		if _, err = z.w.Write(z.z.Encrypt(header)); err != nil {
+			return 0, err
+		}
 	}
-	z.w.Write(z.z.Encrypt(p))
+	nn, err := z.w.Write(z.z.Encrypt(p))
+	n = nn
 	return
 }
 
-func ZipCryptoEncryptor(i io.Writer, pass passwordFn, fw *fileWriter) (io.Writer, error)  {
+func ZipCryptoEncryptor(i io.Writer, pass passwordFn, fw *fileWriter) (io.Writer, error) {
 	z := NewZipCrypto(pass())
 	zc := &zipCryptoWriter{i, z, true, fw}
 	return zc, nil

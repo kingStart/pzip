@@ -65,8 +65,10 @@ const (
 	uint32max = (1 << 32) - 1
 
 	// extra header id's
-	zip64ExtraId     = 0x0001 // zip64 Extended Information Extra Field
-	winzipAesExtraId = 0x9901 // winzip AES Extra Field
+	zip64ExtraId         = 0x0001 // zip64 Extended Information Extra Field
+	extTimeExtraId       = 0x5455 // Extended Timestamp Extra Field
+	infoZipUnixExtraId   = 0x7875 // Info-ZIP Unix Extra Field (new)
+	winzipAesExtraId     = 0x9901 // winzip AES Extra Field
 )
 
 // FileHeader describes a file within a zip file.
@@ -92,6 +94,14 @@ type FileHeader struct {
 	Extra              []byte
 	ExternalAttrs      uint32 // Meaning depends on CreatorVersion
 	Comment            string
+
+	// Modified is the modification time from the extended timestamp extra
+	// field (0x5455). It has second precision (vs MS-DOS 2-second resolution).
+	// When reading, if the extended timestamp is present, Modified is set from
+	// it; otherwise, Modified is derived from ModifiedTime/ModifiedDate.
+	// When writing, if Modified is set (non-zero), an extended timestamp extra
+	// field is written.
+	Modified time.Time
 
 	// DeferAuth being set to true will delay hmac auth/integrity
 	// checks when decrypting a file meaning the reader will be
@@ -157,6 +167,8 @@ type directoryEnd struct {
 	directoryRecords   uint64
 	directorySize      uint64
 	directoryOffset    uint64 // relative to file
+	directoryEndOffset int64  // absolute offset of EOCD record in file
+	zip64EOCDOffset    int64  // offset of zip64 EOCD record, or -1 if absent
 	commentLen         uint16
 	comment            string
 }

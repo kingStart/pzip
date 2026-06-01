@@ -304,7 +304,11 @@ func newDecryptionReader(r *io.SectionReader, f *File) (io.Reader, error) {
 		return nil, ErrPassword
 	}
 	dataOff := int64(saltLen + 2)
-	dataLen := int64(f.CompressedSize64 - uint64(saltLen) - 2 - 10)
+	overhead := uint64(saltLen) + 2 + 10
+	if f.CompressedSize64 < overhead {
+		return nil, ErrFormat
+	}
+	dataLen := int64(f.CompressedSize64 - overhead)
 	// // TODO(alex): Should the compressed sizes be fixed?
 	// // Not the ideal place to do this.
 	// f.CompressedSize64 = uint64(dataLen)

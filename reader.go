@@ -13,18 +13,23 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"path"
+	"strings"
+	"time"
 )
 
 var (
-	ErrFormat    = errors.New("zip: not a valid zip file")
-	ErrAlgorithm = errors.New("zip: unsupported compression algorithm")
-	ErrChecksum  = errors.New("zip: checksum error")
+	ErrFormat       = errors.New("zip: not a valid zip file")
+	ErrAlgorithm    = errors.New("zip: unsupported compression algorithm")
+	ErrChecksum     = errors.New("zip: checksum error")
+	ErrInsecurePath = errors.New("zip: insecure file path")
 )
 
 type Reader struct {
-	r       io.ReaderAt
-	File    []*File
-	Comment string
+	r          io.ReaderAt
+	File       []*File
+	Comment    string
+	baseOffset int64 // offset of the ZIP data within the underlying file
 }
 
 type ReadCloser struct {
@@ -84,8 +89,21 @@ func (z *Reader) init(r io.ReaderAt, size int64) error {
 	z.r = r
 	z.File = make([]*File, 0, end.directoryRecords)
 	z.Comment = end.comment
+	// baseOffset compensates for ZIPs embedded within other files (APK, JAR,
+	// self-extracting archives). The CD immediately precedes either the ZIP64
+	// EOCD (if present) or the regular EOCD.
+	var cdEnd int64
+	if end.zip64EOCDOffset >= 0 {
+		cdEnd = end.zip64EOCDOffset
+	} else {
+		cdEnd = end.directoryEndOffset
+	}
+	z.baseOffset = cdEnd - int64(end.directorySize) - int64(end.directoryOffset)
+	if z.baseOffset < 0 {
+		z.baseOffset = 0
+	}
 	rs := io.NewSectionReader(r, 0, size)
-	if _, err = rs.Seek(int64(end.directoryOffset), os.SEEK_SET); err != nil {
+	if _, err = rs.Seek(int64(end.directoryOffset)+z.baseOffset, io.SeekStart); err != nil {
 		return err
 	}
 	buf := bufio.NewReader(rs)
@@ -103,6 +121,7 @@ func (z *Reader) init(r io.ReaderAt, size int64) error {
 		if err != nil {
 			return err
 		}
+		f.headerOffset += z.baseOffset
 		z.File = append(z.File, f)
 	}
 	if uint16(len(z.File)) != uint16(end.directoryRecords) { // only compare 16 bits here
@@ -110,7 +129,33 @@ func (z *Reader) init(r io.ReaderAt, size int64) error {
 		// the wrong number of directory entries.
 		return err
 	}
+	for _, f := range z.File {
+		if isInsecurePath(f.Name) {
+			return ErrInsecurePath
+		}
+	}
 	return nil
+}
+
+// isInsecurePath reports whether the file name is unsafe: absolute, contains
+// ".." traversal components, starts with a drive letter (Windows), or uses
+// backslashes.
+func isInsecurePath(name string) bool {
+	if name == "" {
+		return false
+	}
+	if strings.HasPrefix(name, "/") || strings.HasPrefix(name, `\`) {
+		return true
+	}
+	if len(name) >= 2 && name[1] == ':' && ((name[0] >= 'a' && name[0] <= 'z') || (name[0] >= 'A' && name[0] <= 'Z')) {
+		return true
+	}
+	for _, c := range strings.Split(path.Clean(name), "/") {
+		if c == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // Close closes the Zip file, rendering it unusable for I/O.
@@ -131,6 +176,18 @@ func (f *File) DataOffset() (offset int64, err error) {
 	return f.headerOffset + bodyOffset, nil
 }
 
+// OpenRaw returns a Reader that provides access to the File's raw
+// (compressed and possibly encrypted) data. The returned data should not
+// be decompressed or decrypted—it is suitable for use with Writer.Copy.
+func (f *File) OpenRaw() (io.Reader, error) {
+	bodyOffset, err := f.findBodyOffset()
+	if err != nil {
+		return nil, err
+	}
+	r := io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset, int64(f.CompressedSize64))
+	return r, nil
+}
+
 // Open returns a ReadCloser that provides access to the File's contents.
 // Multiple files may be read concurrently.
 func (f *File) Open() (rc io.ReadCloser, err error) {
@@ -138,16 +195,13 @@ func (f *File) Open() (rc io.ReadCloser, err error) {
 	if err != nil {
 		return
 	}
-	// If f is encrypted, CompressedSize64 includes salt, pwvv, encrypted data,
-	// and auth code lengths
 	size := int64(f.CompressedSize64)
 	var r io.Reader
 	rr := io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset, size)
-	// check for encryption
 	if f.IsEncrypted() {
-
 		if f.ae == 0 {
-			if r, err = ZipCryptoDecryptor(rr, f.password()); err != nil {
+			checkByte := f.zipCryptoCheckByte()
+			if r, err = ZipCryptoDecryptor(rr, f.password(), checkByte); err != nil {
 				return
 			}
 		} else if r, err = newDecryptionReader(rr, f); err != nil {
@@ -162,7 +216,6 @@ func (f *File) Open() (rc io.ReadCloser, err error) {
 		return
 	}
 	rc = dcomp(r)
-	// If AE-2, skip CRC and possible dataDescriptor
 	if f.isAE2() {
 		return
 	}
@@ -179,57 +232,20 @@ func (f *File) Open() (rc io.ReadCloser, err error) {
 	return
 }
 
-// OpenStream returns a ReadCloser that provides access to the File's contents
-// using streaming decryption for ZipCrypto encrypted files.
-// This method is memory-efficient for large encrypted files as it decrypts
-// data on-the-fly without loading the entire file into memory.
-// For AES encrypted files, it behaves the same as Open() since AES decryption
-// is already streaming.
-// Multiple files may be read concurrently.
-func (f *File) OpenStream() (rc io.ReadCloser, err error) {
-	bodyOffset, err := f.findBodyOffset()
-	if err != nil {
-		return
-	}
-	// If f is encrypted, CompressedSize64 includes salt, pwvv, encrypted data,
-	// and auth code lengths
-	size := int64(f.CompressedSize64)
-	var r io.Reader
-	rr := io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset, size)
-	// check for encryption
-	if f.IsEncrypted() {
-		if f.ae == 0 {
-			// Use streaming decryption for ZipCrypto
-			if r, err = ZipCryptoDecryptorStream(rr, f.password()); err != nil {
-				return
-			}
-		} else if r, err = newDecryptionReader(rr, f); err != nil {
-			return
-		}
-	} else {
-		r = rr
-	}
-	dcomp := decompressor(f.Method)
-	if dcomp == nil {
-		err = ErrAlgorithm
-		return
-	}
-	rc = dcomp(r)
-	// If AE-2, skip CRC and possible dataDescriptor
-	if f.isAE2() {
-		return
-	}
-	var desr io.Reader
+// zipCryptoCheckByte returns the expected check byte for ZipCrypto password
+// verification. Per PKWARE APPNOTE 6.1.4: when data descriptor flag (bit 3)
+// is set, use the high byte of ModifiedTime; otherwise, use the high byte of CRC-32.
+func (f *File) zipCryptoCheckByte() byte {
 	if f.hasDataDescriptor() {
-		desr = io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset+size, dataDescriptorLen)
+		return byte(f.ModifiedTime >> 8)
 	}
-	rc = &checksumReader{
-		rc:   rc,
-		hash: crc32.NewIEEE(),
-		f:    f,
-		desr: desr,
-	}
-	return
+	return byte(f.CRC32 >> 24)
+}
+
+// OpenStream is an alias for Open. Kept for backward compatibility.
+// Both methods now use streaming decryption with password verification.
+func (f *File) OpenStream() (rc io.ReadCloser, err error) {
+	return f.Open()
 }
 
 type checksumReader struct {
@@ -373,10 +389,21 @@ func readDirectoryHeader(f *File, r io.Reader) error {
 					f.headerOffset = int64(eb.uint64())
 				}
 			case winzipAesExtraId:
+				if len(eb) < 7 {
+					return ErrFormat
+				}
 				f.ae = eb.uint16()
 				_ = eb.uint16() // vendor ID
 				f.aesStrength = eb.uint8()
 				f.Method = eb.uint16()
+			case extTimeExtraId:
+				if len(eb) >= 1 {
+					flags := eb.uint8()
+					if flags&1 != 0 && len(eb) >= 4 {
+						ts := eb.uint32()
+						f.Modified = time.Unix(int64(ts), 0)
+					}
+				}
 			}
 			b = b[size:]
 		}
@@ -392,6 +419,9 @@ func readDirectoryHeader(f *File, r io.Reader) error {
 
 	if needUSize || needCSize || needHeaderOffset {
 		return ErrFormat
+	}
+	if f.Modified.IsZero() {
+		f.Modified = msDosTimeToTime(f.ModifiedDate, f.ModifiedTime)
 	}
 	return nil
 }
@@ -469,6 +499,8 @@ func readDirectoryEnd(r io.ReaderAt, size int64) (dir *directoryEnd, err error) 
 		directoryOffset:    uint64(b.uint32()),
 		commentLen:         b.uint16(),
 	}
+	d.directoryEndOffset = directoryEndOffset
+	d.zip64EOCDOffset = -1
 	l := int(d.commentLen)
 	if l > len(b) {
 		return nil, errors.New("zip: invalid comment length")
@@ -477,6 +509,7 @@ func readDirectoryEnd(r io.ReaderAt, size int64) (dir *directoryEnd, err error) 
 
 	p, err := findDirectory64End(r, directoryEndOffset)
 	if err == nil && p >= 0 {
+		d.zip64EOCDOffset = p
 		err = readDirectory64End(r, p, d)
 	}
 	if err != nil {

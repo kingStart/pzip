@@ -108,8 +108,9 @@ var tests = []ZipTest{
 		Name: "readme.zip",
 	},
 	{
-		Name:  "readme.notzip",
-		Error: ErrFormat,
+		// readme.notzip is a valid ZIP with 20 bytes of prepended junk.
+		// With baseOffset support, the embedded ZIP is correctly read.
+		Name: "readme.notzip",
 	},
 	{
 		Name: "dd.zip",
